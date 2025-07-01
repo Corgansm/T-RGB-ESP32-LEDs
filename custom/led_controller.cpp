@@ -84,6 +84,7 @@ static lv_obj_t *label_level;
 int batteryPercentage = 100;
 uint32_t lastBatteryRead = 0;
 lv_obj_t *batteryLabel;
+lv_obj_t *batteryIcon;
 
 // =============================================================================
 // FUNCTION PROTOTYPES
@@ -99,6 +100,7 @@ void updateStats();
 void sendCommand();
 void sendHeartbeat();
 void readBatteryLevel();
+void updateBatteryDisplay();
 
 // Event handlers
 void colorPickerEvent(lv_event_t *e);
@@ -246,6 +248,10 @@ void setup() {
     // Initialize battery monitoring
     pinMode(BATTERY_PIN, INPUT);
     analogReadResolution(12); // Set to 12-bit resolution if using ESP32
+    analogSetAttenuation(ADC_11db); // For full 0-3.3V range
+    
+    // Take initial battery reading
+    readBatteryLevel();
 
     // Set display brightness
     panel.setBrightness(10);
@@ -472,11 +478,24 @@ void createDisplayPage(lv_obj_t *parent) {
     lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
 
-    // Battery indicator
-    batteryLabel = lv_label_create(parent);
-    lv_label_set_text(batteryLabel, "Battery: --%");
+    // Battery display container
+    lv_obj_t *batteryCont = lv_obj_create(parent);
+    lv_obj_set_size(batteryCont, DISPLAY_RADIUS+70, 40);
+    lv_obj_align(batteryCont, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_set_style_bg_color(batteryCont, lv_color_hex(0x2a2a2a), 0);
+    lv_obj_set_style_radius(batteryCont, 10, 0);
+    lv_obj_set_flex_flow(batteryCont, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(batteryCont, LV_FLEX_ALIGN_SPACE_AROUND, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    // Battery icon (using LVGL symbol)
+    batteryIcon = lv_label_create(batteryCont);
+    lv_label_set_text(batteryIcon, LV_SYMBOL_BATTERY_FULL);
+    lv_obj_set_style_text_font(batteryIcon, &lv_font_montserrat_20, 0);
+
+    // Battery percentage label
+    batteryLabel = lv_label_create(batteryCont);
+    lv_label_set_text(batteryLabel, "100%");
     lv_obj_set_style_text_color(batteryLabel, lv_color_white(), 0);
-    lv_obj_align(batteryLabel, LV_ALIGN_TOP_MID, 0, 40);
 
     // Backlight slider
     lv_obj_t *backlightSlider = lv_slider_create(parent);
@@ -584,24 +603,35 @@ void readBatteryLevel() {
     if (millis() - lastBatteryRead < BATTERY_READ_INTERVAL) return;
     lastBatteryRead = millis();
 
-    // Read analog value (0-4095 for ESP32)
+    // Read raw ADC value (0-4095 for ESP32)
     int rawValue = analogRead(BATTERY_PIN);
     
-    // Convert to voltage (assuming voltage divider with 100k+100k resistors)
-    float voltage = rawValue * (3.3 / 4095.0) * 2.0; // Multiply by 2 for voltage divider
+    // Convert to percentage (0-100) - this will depend on your specific hardware
+    // You may need to calibrate these values for your specific battery
+    batteryPercentage = map(rawValue, 0, 4095, 0, 100);
+    batteryPercentage = constrain(batteryPercentage, 0, 100);
     
-    // Calculate percentage (simple linear approximation)
-    voltage = constrain(voltage, BATTERY_MIN_VOLTAGE, BATTERY_MAX_VOLTAGE);
-    batteryPercentage = map(voltage * 100, BATTERY_MIN_VOLTAGE * 100, BATTERY_MAX_VOLTAGE * 100, 0, 100);
+    // Update battery display
+    updateBatteryDisplay();
     
-    // Update battery label if it exists
-    if (batteryLabel) {
-        char batText[32];
-        snprintf(batText, sizeof(batText), "Battery: %d%% (%.2fV)", batteryPercentage, voltage);
-        lv_label_set_text(batteryLabel, batText);
-    }
-    
-    Serial.printf("Battery: %d%% (%.2fV)\n", batteryPercentage, voltage);
+    Serial.printf("Battery: %d%% (Raw: %d)\n", batteryPercentage, rawValue);
+}
+
+void updateBatteryDisplay() {
+    if (!batteryLabel || !batteryIcon) return;
+
+    // Update text label
+    char batText[32];
+    snprintf(batText, sizeof(batText), "Battery: %d%%", batteryPercentage);
+    lv_label_set_text(batteryLabel, batText);
+
+    // Update icon color based on level
+    lv_color_t color;
+    if (batteryPercentage > 60) color = lv_color_hex(0x00FF00); // Green
+    else if (batteryPercentage > 30) color = lv_color_hex(0xFFFF00); // Yellow
+    else color = lv_color_hex(0xFF0000); // Red
+
+    lv_obj_set_style_text_color(batteryIcon, color, 0);
 }
 
 void updateStatus(const char *message, bool isError) {
