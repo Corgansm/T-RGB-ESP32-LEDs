@@ -20,6 +20,11 @@
 #define DISPLAY_RADIUS 240
 #define DEFAULT_BRIGHTNESS 16
 #define ESPNOW_CHANNEL 1
+#define BATTERY_PIN 4          // IO04 for battery capacity detection
+#define BATTERY_MIN_VOLTAGE 3.3 // Minimum voltage when battery is empty
+#define BATTERY_MAX_VOLTAGE 4.2 // Maximum voltage when battery is full
+#define BATTERY_CAPACITY 5000   // Battery capacity in mAh (5000mAh)
+#define BATTERY_READ_INTERVAL 60000 // Read battery every 60 seconds
 
 // Receiver's MAC address - UPDATE THIS TO MATCH YOUR RECEIVER
 uint8_t receiverAddress[] = {0x6C, 0xC8, 0x40, 0x88, 0x58, 0xA0};
@@ -76,6 +81,10 @@ static lv_obj_t *tv;
 static lv_obj_t *label;
 static lv_obj_t *label_level;
 
+int batteryPercentage = 100;
+uint32_t lastBatteryRead = 0;
+lv_obj_t *batteryLabel;
+
 // =============================================================================
 // FUNCTION PROTOTYPES
 // =============================================================================
@@ -89,6 +98,7 @@ void updateStatus(const char *message, bool isError = false);
 void updateStats();
 void sendCommand();
 void sendHeartbeat();
+void readBatteryLevel();
 
 // Event handlers
 void colorPickerEvent(lv_event_t *e);
@@ -233,6 +243,10 @@ void setup() {
     // Create UI
     createUI();
 
+    // Initialize battery monitoring
+    pinMode(BATTERY_PIN, INPUT);
+    analogReadResolution(12); // Set to 12-bit resolution if using ESP32
+
     // Set display brightness
     panel.setBrightness(10);
 
@@ -252,7 +266,8 @@ void loop() {
     lv_timer_handler();  // LVGL's periodic update
     delay(5);            // Required LVGL delay
     
-    
+    readBatteryLevel();
+
     // Send periodic heartbeat to maintain connection
     if (millis() - lastHeartbeat > HEARTBEAT_INTERVAL) {
         sendHeartbeat();
@@ -457,6 +472,12 @@ void createDisplayPage(lv_obj_t *parent) {
     lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
 
+    // Battery indicator
+    batteryLabel = lv_label_create(parent);
+    lv_label_set_text(batteryLabel, "Battery: --%");
+    lv_obj_set_style_text_color(batteryLabel, lv_color_white(), 0);
+    lv_obj_align(batteryLabel, LV_ALIGN_TOP_MID, 0, 40);
+
     // Backlight slider
     lv_obj_t *backlightSlider = lv_slider_create(parent);
     lv_slider_set_range(backlightSlider, 1, 16);
@@ -558,6 +579,31 @@ void speedSliderEvent(lv_event_t *e) {
 // =============================================================================
 // UTILITY FUNCTIONS
 // =============================================================================
+
+void readBatteryLevel() {
+    if (millis() - lastBatteryRead < BATTERY_READ_INTERVAL) return;
+    lastBatteryRead = millis();
+
+    // Read analog value (0-4095 for ESP32)
+    int rawValue = analogRead(BATTERY_PIN);
+    
+    // Convert to voltage (assuming voltage divider with 100k+100k resistors)
+    float voltage = rawValue * (3.3 / 4095.0) * 2.0; // Multiply by 2 for voltage divider
+    
+    // Calculate percentage (simple linear approximation)
+    voltage = constrain(voltage, BATTERY_MIN_VOLTAGE, BATTERY_MAX_VOLTAGE);
+    batteryPercentage = map(voltage * 100, BATTERY_MIN_VOLTAGE * 100, BATTERY_MAX_VOLTAGE * 100, 0, 100);
+    
+    // Update battery label if it exists
+    if (batteryLabel) {
+        char batText[32];
+        snprintf(batText, sizeof(batText), "Battery: %d%% (%.2fV)", batteryPercentage, voltage);
+        lv_label_set_text(batteryLabel, batText);
+    }
+    
+    Serial.printf("Battery: %d%% (%.2fV)\n", batteryPercentage, voltage);
+}
+
 void updateStatus(const char *message, bool isError) {
     if (statusLabel) {
         String statusText = isError ? "❌ " : "✅ ";
@@ -572,8 +618,10 @@ void updateStatus(const char *message, bool isError) {
 
 void updateStats() {
     if (statsLabel) {
-        String stats = "Sent: " + String(commandsSent) + " | Requests: " + String(requestsReceived);
-        lv_label_set_text(statsLabel, stats.c_str());
+        char stats[64];
+        snprintf(stats, sizeof(stats), "Sent: %d | Requests: %d | Battery: %d%%", 
+                commandsSent, requestsReceived, batteryPercentage);
+        lv_label_set_text(statsLabel, stats);
     }
 }
 
