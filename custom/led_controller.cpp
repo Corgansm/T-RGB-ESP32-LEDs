@@ -24,7 +24,7 @@
 #define BATTERY_MIN_VOLTAGE 3.3 // Minimum voltage when battery is empty
 #define BATTERY_MAX_VOLTAGE 4.2 // Maximum voltage when battery is full
 #define BATTERY_CAPACITY 5000   // Battery capacity in mAh (5000mAh)
-#define BATTERY_READ_INTERVAL 60000 // Read battery every 60 seconds
+#define BATTERY_READ_INTERVAL 1000 // Read battery every 60 seconds
 
 // Receiver's MAC address - UPDATE THIS TO MATCH YOUR RECEIVER
 uint8_t receiverAddress[] = {0x6C, 0xC8, 0x40, 0x88, 0x58, 0xA0};
