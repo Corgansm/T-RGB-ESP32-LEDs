@@ -62,6 +62,12 @@ typedef struct {
     uint8_t speed;
 } led_command_t;
 
+typedef struct {
+    uint8_t requestType;  // 2 = serial data
+    char data[50];       // Adjust size as needed
+    uint8_t length;       // Actual length of the data
+} serial_message_t;
+
 // =============================================================================
 // GLOBAL VARIABLES
 // =============================================================================
@@ -157,6 +163,20 @@ void OnDataRecv(const esp_now_recv_info *recv_info, const uint8_t *incomingData,
                      receivedCommand.blue, receivedCommand.effect);
     } else {
         Serial.printf("⚠️  Invalid data length: %d (expected %d)\n", len, sizeof(led_command_t));
+    }
+
+    if (len >= sizeof(serial_message_t)) {
+        serial_message_t serialMsg;
+        memcpy(&serialMsg, incomingData, sizeof(serialMsg));
+        
+        if (serialMsg.requestType == 2) {  // It's serial data
+            Serial.printf("Received serial data (%.*s)\n", serialMsg.length, serialMsg.data);
+            
+            // Process the received serial data here
+            // For example, you could echo it to the local serial port:
+            Serial.write((uint8_t*)serialMsg.data, serialMsg.length);
+            Serial.println();
+        }
     }
 }
 
