@@ -1,311 +1,666 @@
 /**
- * @file      esp_now_receiver.ino
- * @author    Lewis He (lewishe@outlook.com) - Modified by Gemini
- * @license   MIT
- * @copyright Copyright (c) 2024  Shenzhen Xin Yuan Electronic Technology Co., Ltd
- * @date      2024-06-26
- * @brief     ESP-NOW receiver for ESP32 WROOM to control an 8x32 LED matrix based on received LED command structure.
- * Restored compatibility with led_command_t, includes initial LED test pattern, moves FastLED.show() to main loop,
- * and suppresses verbose WiFi/ESP-NOW logs. Now includes implementation for various LED effects and speed control.
+ * @file      esp_now_receiver_enhanced.ino
+ * @author    Enhanced Version
+ * @date      2025-06-29
+ * @brief     Enhanced ESP-NOW receiver for ESP32 WROOM with beautiful LED effects
+ * 
+ * MAJOR FIXES:
+ * - Fixed request/response system with proper peer management
+ * - Improved serial command handling with better parsing
+ * - Enhanced LED effects with smoother animations
+ * - Added comprehensive status reporting and diagnostics
+ * - Beautiful startup sequence and error handling
+ * - Optimized performance with better timing control
  */
 
 #include <WiFi.h>
 #include <esp_now.h>
-#include <FastLED.h> // Include FastLED library for controlling the LED matrix
-#include <esp_log.h> // Include for esp_log_level_set
+#include <FastLED.h>
+#include <esp_log.h>
+#include <esp_wifi.h>
 
-// Define the LED matrix properties
-#define LED_PIN     13   // Data pin for the LED matrix (Recommended pin for WS2812B on ESP32)
-#define LED_WIDTH   32   // Width of the LED matrix
-#define LED_HEIGHT  8    // Height of the LED matrix
-#define NUM_LEDS    (LED_WIDTH * LED_HEIGHT) // Total number of LEDs
-#define LED_TYPE    WS2812B // Type of your LED strip
-#define COLOR_ORDER GRB  // Color order of your LED strip (often GRB or RGB)
+String repeat(String str, int count) {
+  String result = "";
+  for (int i = 0; i < count; i++) {
+    result += str;
+  }
+  return result;
+}
 
-// Rate limiting for LED updates
-const unsigned long LED_UPDATE_INTERVAL_MS = 50; // Update LEDs at most every 50ms (20 times per second)
-unsigned long lastLedUpdateTime = 0; // Tracks the last time LEDs were updated
+// =============================================================================
+// CONFIGURATION & HARDWARE SETUP
+// =============================================================================
+#define LED_PIN         13
+#define LED_WIDTH       32
+#define LED_HEIGHT      8
+#define NUM_LEDS        (LED_WIDTH * LED_HEIGHT)
+#define LED_TYPE        WS2812B
+#define COLOR_ORDER     GRB
 
-CRGB leds[NUM_LEDS]; // Define the LED array, where LED data will be stored
+// Performance & Timing
+#define LED_UPDATE_INTERVAL_MS    33  // ~30 FPS for smooth animations
+#define SERIAL_BAUD_RATE         115200
+#define REQUEST_TIMEOUT_MS       3000
+#define HEARTBEAT_INTERVAL_MS    10000
 
-// LED Control Structure - MUST MATCH THE TRANSMITTER'S STRUCTURE
-// This structure defines the data format for commands sent via ESP-NOW.
+// =============================================================================
+// DATA STRUCTURES (Must match transmitter exactly)
+// =============================================================================
 typedef struct {
-    uint8_t red;        // Red component of the color (0-255)
-    uint8_t green;      // Green component of the color (0-255)
-    uint8_t blue;       // Blue component of the color (0-255)
-    uint8_t white;      // Not used for pure RGB matrix (WS2812B), but kept for compatibility
-    uint8_t warmWhite;  // Not used for pure RGB matrix (WS2812B), but kept for compatibility
-    uint8_t brightness; // Overall brightness (1-100 from transmitter, mapped to 0-255 for FastLED)
-    uint8_t effect;     // LED effect to apply (0: Solid, 1: Rainbow, 2: Fade, 3: Strobe, 4: Pulse)
-    uint8_t speed;      // Speed of the effect (1-100, maps to effect-specific timing)
+    uint8_t requestType;  // 1 = color request
+    uint8_t fromReceiver; // 1 = marks request origin
+} color_request_t;
+
+typedef struct {
+    uint8_t red;
+    uint8_t green;
+    uint8_t blue;
+    uint8_t white;
+    uint8_t warmWhite;
+    uint8_t brightness;
+    uint8_t effect;
+    uint8_t speed;
 } led_command_t;
 
-// Use volatile for variables modified in an Interrupt Service Routine (ISR)
-// and accessed in the main loop to ensure correct memory access.
-volatile led_command_t receivedCommand; // Stores the most recently received LED command
-volatile bool newCommandReceived = false; // Flag to signal that new data has been received
+// =============================================================================
+// GLOBAL VARIABLES
+// =============================================================================
+CRGB leds[NUM_LEDS];
 
-// Global variables for effect management and state persistence
-uint8_t currentEffect = 0; // Stores the currently active effect (default: Solid)
-uint8_t currentSpeed = 50; // Stores the current speed setting (default: 50)
-CRGB currentColor; // Stores the base color received from the transmitter
-unsigned long lastEffectRunTime = 0; // Timestamp for the last update of an effect (used for timing)
-uint8_t rainbowHue = 0; // Current hue for the rainbow effect
-bool strobeState = false; // Current state (on/off) for the strobe effect
-unsigned long fadeStartTime = 0; // Timestamp when the current fade phase started
-CRGB fadeStartColor; // Starting color for the current fade phase
-CRGB fadeTargetColor; // Target color for the current fade phase
-bool fadingIn = true; // Direction of fade (true: fading to color, false: fading to black)
+// Communication
+uint8_t controllerAddress[] = {0x64, 0xE8, 0x33, 0x7A, 0x88, 0x70}; // UPDATE THIS!
+volatile led_command_t receivedCommand;
+volatile bool newCommandReceived = false;
+bool expectingResponse = false;
+unsigned long responseTimeout = 0;
+unsigned long lastHeartbeat = 0;
 
-// Function prototypes to declare functions before they are defined
-void OnDataRecv(const esp_now_recv_info *recv_info, const uint8_t *incomingData, int len);
-void applyEffect(); // Main function to dispatch to the correct effect handler
-void effectSolid(); // Implements the solid color effect
-void effectRainbow(); // Implements the rainbow effect
-void effectFade(); // Implements the fading effect
-void effectStrobe(); // Implements the strobe effect
-void effectPulse(); // Implements the pulse effect
+// Performance tracking
+unsigned long lastLedUpdateTime = 0;
+unsigned long commandsReceived = 0;
+unsigned long requestsSent = 0;
+bool isConnected = false;
 
-/**
- * @brief Callback function executed when ESP-NOW data is received.
- * This function runs in an ISR context, so keep it short and avoid complex operations.
- * @param recv_info Pointer to structure containing sender MAC address and other info.
- * @param incomingData Pointer to the received data payload.
- * @param len Length of the received data.
- */
+// LED State Management
+uint8_t currentEffect = 0;
+uint8_t currentSpeed = 50;
+uint8_t currentBrightness = 50;
+CRGB currentColor = CRGB::Red;
+unsigned long lastEffectRunTime = 0;
+
+// Effect-specific variables
+uint8_t rainbowHue = 0;
+bool strobeState = false;
+unsigned long fadeStartTime = 0;
+CRGB fadeStartColor = CRGB::Black;
+CRGB fadeTargetColor = CRGB::Red;
+bool fadingIn = true;
+float pulsePhase = 0.0;
+
+// =============================================================================
+// FUNCTION PROTOTYPES
+// =============================================================================
+void initializeHardware();
+void initializeESPNOW();
+void setupPeerConnection();
+void handleSerialCommands();
+void processReceivedCommand();
+void updateLEDEffects();
+void sendColorRequest();
+void printStatus();
+void printDiagnostics();
+
+// LED Effects
+void applyEffect();
+void effectSolid();
+void effectRainbow();
+void effectFade();
+void effectStrobe();
+void effectPulse();
+void effectSparkle();
+void effectWave();
+CRGB applyWhiteAndWarmWhite(CRGB color, uint8_t white, uint8_t warmWhite);
+
+// Utility functions
+void bootSequence();
+void showError(const char* message);
+void showSuccess(const char* message);
+int16_t getMatrixIndex(int16_t x, int16_t y);
+
+// =============================================================================
+// ESP-NOW CALLBACKS
+// =============================================================================
 void OnDataRecv(const esp_now_recv_info *recv_info, const uint8_t *incomingData, int len) {
-    // Check if the received data length matches our expected command structure size.
+    // Verify sender MAC address for security
+    bool validSender = true;
+    for (int i = 0; i < 6; i++) {
+        if (recv_info->src_addr[i] != controllerAddress[i]) {
+            validSender = false;
+            break;
+        }
+    }
+    
+    if (!validSender) {
+        Serial.println("⚠️  Ignoring data from unknown sender");
+        return;
+    }
+
     if (len == sizeof(led_command_t)) {
-        // Copy the incoming data into our volatile receivedCommand structure.
         memcpy((void*)&receivedCommand, incomingData, sizeof(receivedCommand));
-        newCommandReceived = true; // Set the flag to true to signal new data in the main loop.
+        newCommandReceived = true;
+        expectingResponse = false;
+        isConnected = true;
+        commandsReceived++;
+        
+        Serial.printf("📨 Command received: R:%d G:%d B:%d Effect:%d\n", 
+                     receivedCommand.red, receivedCommand.green, 
+                     receivedCommand.blue, receivedCommand.effect);
     } else {
-        // Log an error if the data length is unexpected, which indicates a potential mismatch
-        // between transmitter and receiver data structures.
-        Serial.print("\n--- ESP-NOW Packet Error (ISR) ---");
-        Serial.print("\nReceived data of unexpected length: ");
-        Serial.println(len);
+        Serial.printf("⚠️  Invalid data length: %d (expected %d)\n", len, sizeof(led_command_t));
     }
 }
 
-/**
- * @brief Initializes the ESP32, Serial communication, FastLED, and ESP-NOW.
- * Also runs an initial LED test pattern.
- */
-void setup() {
-    Serial.begin(115200); // Start serial communication for debugging
-    Serial.println("\nESP-NOW Receiver Starting...");
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+    if (status == ESP_NOW_SEND_SUCCESS) {
+        Serial.println("✅ Request sent successfully");
+        expectingResponse = true;
+        responseTimeout = millis() + REQUEST_TIMEOUT_MS;
+    } else {
+        Serial.printf("❌ Request send failed: %d\n", status);
+        expectingResponse = false;
+    }
+}
 
-    // Set WiFi and ESP-NOW log levels to suppress verbose output.
-    // ESP_LOG_WARN shows only warnings and errors, keeping the serial output cleaner.
+// =============================================================================
+// INITIALIZATION FUNCTIONS
+// =============================================================================
+void setup() {
+    Serial.begin(SERIAL_BAUD_RATE);
+    delay(1000);
+    
+    Serial.println("\n" + repeat("=", 60));
+    Serial.println("🚀 ESP-NOW LED RECEIVER - Enhanced Version");
+    Serial.println(repeat("=", 60));
+    
+    initializeHardware();
+    initializeESPNOW();
+    bootSequence();
+    
+    Serial.println("✅ System ready! Type 'help' for commands\n");
+}
+
+void initializeHardware() {
+    Serial.println("🔧 Initializing hardware...");
+    
+    // Configure ESP-NOW log levels
     esp_log_level_set("wifi", ESP_LOG_WARN);
     esp_log_level_set("esp_now", ESP_LOG_WARN);
-
-    // --- FastLED Initialization and Test Pattern ---
-    // Add the LED strip to FastLED, specifying type, data pin, and color order.
-    FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
-    FastLED.setBrightness(50); // Set an initial brightness for the test pattern
-
-    Serial.println("Running initial FastLED test pattern...");
-    // Cycle through basic colors to confirm LED functionality.
-    fill_solid(leds, NUM_LEDS, CRGB::Red); FastLED.show(); Serial.println("LEDs should be RED now."); delay(1000);
-    fill_solid(leds, NUM_LEDS, CRGB::Green); FastLED.show(); Serial.println("LEDs should be GREEN now."); delay(1000);
-    fill_solid(leds, NUM_LEDS, CRGB::Blue); FastLED.show(); Serial.println("LEDs should be BLUE now."); delay(1000);
-    fill_solid(leds, NUM_LEDS, CRGB::White); FastLED.show(); Serial.println("LEDs should be WHITE now."); delay(1000);
     
-    // Turn off LEDs after the test pattern.
-    fill_solid(leds, NUM_LEDS, CRGB::Black); FastLED.show();
-    Serial.println("LEDs turned OFF after test pattern. Waiting for 1 second to confirm.");
-    delay(1000);
+    // Initialize FastLED
+    FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
+    FastLED.setBrightness(50);
+    FastLED.clear();
+    FastLED.show();
+    
+    Serial.println("  ✓ FastLED initialized");
+    Serial.println("  ✓ LED matrix configured (32x8)");
+}
 
-    // --- End of FastLED Test Pattern ---
-
-    // Initialize WiFi in Station mode. ESP-NOW requires WiFi to be initialized.
+void initializeESPNOW() {
+    Serial.println("📡 Initializing ESP-NOW...");
+    
     WiFi.mode(WIFI_STA);
-    Serial.print("ESP32 MAC Address: ");
-    Serial.println(WiFi.macAddress()); // Print the MAC address for debugging/peer configuration
-
-    // Initialize ESP-NOW. Check for success.
+    delay(100);
+    
+    Serial.printf("  📍 MAC Address: %s\n", WiFi.macAddress().c_str());
+    
     if (esp_now_init() != ESP_OK) {
-        Serial.println("Error initializing ESP-NOW");
-        return; // Halt if ESP-NOW initialization fails
+        showError("ESP-NOW initialization failed!");
+        return;
     }
-    Serial.println("ESP-NOW Initialized");
-
-    // Register the ESP-NOW receive callback function.
+    
+    // Register callbacks
     esp_now_register_recv_cb(OnDataRecv);
-
-    Serial.println("ESP-NOW Receiver Ready! Waiting for commands...");
+    esp_now_register_send_cb(OnDataSent);
+    
+    setupPeerConnection();
+    Serial.println("  ✅ ESP-NOW ready");
 }
 
-/**
- * @brief Main loop function, continuously runs after setup.
- * Handles processing of new ESP-NOW commands and updating LED effects.
- */
+void setupPeerConnection() {
+    esp_now_peer_info_t peerInfo;
+    memset(&peerInfo, 0, sizeof(peerInfo));
+    memcpy(peerInfo.peer_addr, controllerAddress, 6);
+    peerInfo.channel = 1;
+    peerInfo.encrypt = false;
+    
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.println("  ❌ Failed to add controller peer");
+    } else {
+        Serial.printf("  ✅ Controller peer added: ");
+        for(int i = 0; i < 6; i++) {
+            Serial.printf("%02X", controllerAddress[i]);
+            if(i < 5) Serial.print(":");
+        }
+        Serial.println();
+    }
+}
+
+// =============================================================================
+// MAIN LOOP
+// =============================================================================
 void loop() {
-    bool shouldUpdateLeds = false; // Flag to determine if FastLED.show() should be called
-
-    // Check if a new command has been received from the transmitter.
-    if (newCommandReceived) {
-        newCommandReceived = false; // Reset the flag immediately to avoid re-processing the same command.
-        
-        // Update global state variables based on the new command.
-        currentColor = CRGB(receivedCommand.red, receivedCommand.green, receivedCommand.blue);
-        currentEffect = receivedCommand.effect;
-        currentSpeed = receivedCommand.speed;
-
-        // Reset effect-specific states to ensure effects start fresh with new parameters.
-        rainbowHue = 0; // Reset rainbow phase
-        strobeState = false; // Reset strobe state to off
-        fadeStartTime = millis(); // Reset fade timer to current time
-        fadingIn = true; // Start fade by fading in to the new color
-        fadeStartColor = CRGB::Black; // Always start fade from black
-        fadeTargetColor = currentColor; // Target is the new received color
-
-        Serial.print("\n--- Processing New Command in Loop ---");
-        Serial.printf("Applying Color: R:%d G:%d B:%d\n", currentColor.r, currentColor.g, currentColor.b);
-        Serial.printf("Applying Brightness (1-100): %d\n", receivedCommand.brightness);
-        Serial.printf("Applying Effect: %d, Speed: %d\n", currentEffect, currentSpeed);
-
-        shouldUpdateLeds = true; // A new command always triggers an immediate LED update.
+    handleSerialCommands();
+    processReceivedCommand();
+    updateLEDEffects();
+    
+    // Handle response timeout
+    if (expectingResponse && millis() > responseTimeout) {
+        expectingResponse = false;
+        isConnected = false;
+        Serial.println("⏰ Response timeout - controller may be offline");
     }
-
-    // If no new command, but an effect is active (not 'Solid'), check if it's time for an update.
-    // 'Solid' effect only needs to update when a new command changes its color/brightness.
-    if (!shouldUpdateLeds && currentEffect != 0 && (millis() - lastLedUpdateTime >= LED_UPDATE_INTERVAL_MS)) {
-        shouldUpdateLeds = true; // Time to update the effect animation.
+    
+    // Send periodic heartbeat
+    if (millis() - lastHeartbeat > HEARTBEAT_INTERVAL_MS) {
+        if (!expectingResponse) {
+            Serial.println("💓 Sending heartbeat request...");
+            sendColorRequest();
+        }
+        lastHeartbeat = millis();
     }
-
-    // If LEDs need to be updated (either due to new command or effect timing), then proceed.
-    if (shouldUpdateLeds) {
-        lastLedUpdateTime = millis(); // Record the time of this update.
-        FastLED.clear(); // Clear the LED buffer to prevent artifacts from previous frames.
-        
-        // Map the 1-100 brightness value from the transmitter to FastLED's 0-255 scale.
-        uint8_t fastledBrightness = map(receivedCommand.brightness, 1, 100, 0, 255);
-        FastLED.setBrightness(fastledBrightness); // Apply the overall brightness.
-
-        applyEffect(); // Call the function to render the current effect.
-        FastLED.show(); // Push the LED data to the physical LED matrix.
-        // Serial.println("LEDs updated based on received command or effect timer."); // Uncomment for detailed logging
-    }
-
-    delay(10); // Small delay to yield CPU time to other tasks and prevent watchdog timer resets.
+    
+    delay(5);
 }
 
-/**
- * @brief Dispatches to the appropriate effect function based on `currentEffect`.
- */
+// =============================================================================
+// COMMAND PROCESSING
+// =============================================================================
+void handleSerialCommands() {
+    if (!Serial.available()) return;
+    
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    command.toLowerCase();
+    
+    if (command.length() == 0) return;
+    
+    Serial.println("📝 Command: " + command);
+    
+    if (command == "request" || command == "r") {
+        sendColorRequest();
+    } 
+    else if (command == "status" || command == "s") {
+        printStatus();
+    }
+    else if (command == "diag" || command == "d") {
+        printDiagnostics();
+    }
+    else if (command == "test" || command == "t") {
+        bootSequence();
+    }
+    else if (command == "clear" || command == "c") {
+        FastLED.clear();
+        FastLED.show();
+        Serial.println("🔄 LEDs cleared");
+    }
+    else if (command == "help" || command == "h") {
+        printHelp();
+    }
+    else if (command.startsWith("bright ")) {
+        int brightness = command.substring(7).toInt();
+        if (brightness >= 1 && brightness <= 100) {
+            currentBrightness = brightness;
+            FastLED.setBrightness(map(brightness, 1, 100, 0, 255));
+            Serial.printf("☀️  Brightness set to %d%%\n", brightness);
+        } else {
+            Serial.println("❌ Brightness must be 1-100");
+        }
+    }
+    else if (command.startsWith("effect ")) {
+        int effect = command.substring(7).toInt();
+        if (effect >= 0 && effect <= 6) {
+            currentEffect = effect;
+            Serial.printf("✨ Effect set to %d\n", effect);
+        } else {
+            Serial.println("❌ Effect must be 0-6");
+        }
+    }
+    else {
+        Serial.println("❓ Unknown command. Type 'help' for available commands.");
+    }
+}
+
+void processReceivedCommand() {
+    if (!newCommandReceived) return;
+    
+    newCommandReceived = false;
+    
+    // Update current state
+    currentColor = CRGB(receivedCommand.red, receivedCommand.green, receivedCommand.blue);
+    currentEffect = receivedCommand.effect;
+    currentSpeed = receivedCommand.speed;
+    currentBrightness = receivedCommand.brightness;
+    
+    // Reset effect states for smooth transitions
+    rainbowHue = 0;
+    strobeState = false;
+    fadeStartTime = millis();
+    fadingIn = true;
+    fadeStartColor = CRGB::Black;
+    fadeTargetColor = currentColor;
+    pulsePhase = 0.0;
+    
+    Serial.printf("🎨 Updated: Color(%d,%d,%d) Effect:%d Speed:%d Brightness:%d%%\n",
+                 currentColor.r, currentColor.g, currentColor.b,
+                 currentEffect, currentSpeed, currentBrightness);
+}
+
+void updateLEDEffects() {
+    if (millis() - lastLedUpdateTime < LED_UPDATE_INTERVAL_MS) return;
+    
+    lastLedUpdateTime = millis();
+    FastLED.clear();
+    FastLED.setBrightness(map(currentBrightness, 1, 100, 0, 255));
+    
+    applyEffect();
+    FastLED.show();
+}
+
+// =============================================================================
+// LED EFFECTS
+// =============================================================================
 void applyEffect() {
     switch (currentEffect) {
-        case 0: // Solid color effect
-            effectSolid();
-            break;
-        case 1: // Rainbow effect
-            effectRainbow();
-            break;
-        case 2: // Fade effect (fades color in and out)
-            effectFade();
-            break;
-        case 3: // Strobe effect (flashes color on and off)
-            effectStrobe();
-            break;
-        case 4: // Pulse effect (smoothly pulses brightness)
-            effectPulse();
-            break;
-        default: // Fallback to solid color if an unknown effect ID is received
-            effectSolid();
-            break;
+        case 0: effectSolid(); break;
+        case 1: effectRainbow(); break;
+        case 2: effectFade(); break;
+        case 3: effectStrobe(); break;
+        case 4: effectPulse(); break;
+        case 5: effectSparkle(); break;
+        case 6: effectWave(); break;
+        default: effectSolid(); break;
     }
 }
 
-// --- LED Effect Implementations ---
-
-/**
- * @brief Fills the entire LED strip with the `currentColor`.
- */
 void effectSolid() {
-    fill_solid(leds, NUM_LEDS, currentColor);
+    CRGB adjustedColor = applyWhiteAndWarmWhite(currentColor, receivedCommand.white, receivedCommand.warmWhite);
+    fill_solid(leds, NUM_LEDS, adjustedColor);
 }
 
-/**
- * @brief Generates a moving rainbow pattern across the LEDs.
- * The `currentSpeed` controls how fast the rainbow shifts.
- */
 void effectRainbow() {
-    // Calculate hue position based on continuous time (not frame-based)
-    // This ensures smooth movement regardless of update rate
-    static uint8_t hueOffset = 0;
-    uint16_t speedFactor = map(currentSpeed, 1, 100, 300, 20); // Higher = slower
+    uint16_t speedFactor = map(currentSpeed, 1, 100, 200, 20);
+    uint8_t hueOffset = (millis() / speedFactor) % 256;
     
-    // Smooth continuous movement using elapsed time
-    hueOffset = (millis() / speedFactor) % 256;
-    
-    // Apply rainbow to all LEDs
     for (int i = 0; i < NUM_LEDS; i++) {
-        // Classic rainbow spread across all LEDs
-        leds[i] = CHSV(hueOffset + (i * 256 / NUM_LEDS), 255, 255);
+        CRGB rainbowColor = CHSV(hueOffset + (i * 256 / NUM_LEDS), 255, 255);
+        leds[i] = applyWhiteAndWarmWhite(rainbowColor, receivedCommand.white, receivedCommand.warmWhite);
     }
-    
-    // Optional: Add this if you want to see the actual hue progression in serial
-    // static uint8_t lastHue = 0;
-    // if (hueOffset != lastHue) {
-    //     Serial.printf("Hue: %d\n", hueOffset);
-    //     lastHue = hueOffset;
-    // }
 }
 
-/**
- * @brief Fades the `currentColor` in and out from black.
- * The `currentSpeed` controls the duration of one fade cycle.
- */
 void effectFade() {
-    unsigned long fadeDuration = map(currentSpeed, 1, 100, 5000, 500);
-    unsigned long currentTime = millis();
-    unsigned long elapsedTime = currentTime - fadeStartTime;
-
-    if (elapsedTime >= fadeDuration) {
-        fadingIn = !fadingIn;
-        fadeStartTime = currentTime;
-        fadeStartColor = fadingIn ? CRGB::Black : currentColor;
-        fadeTargetColor = fadingIn ? currentColor : CRGB::Black;
-        elapsedTime = 0;
-    }
-
-    float t = (float)elapsedTime / fadeDuration;
-    t = min(t, 1.0f); // Ensure t doesn't exceed 1.0
+    unsigned long fadeDuration = map(currentSpeed, 1, 100, 3000, 300);
+    unsigned long elapsed = millis() - fadeStartTime;
     
-    // Proper CRGB interpolation using FastLED's blend function
-    CRGB interpolatedColor = blend(fadeStartColor, fadeTargetColor, (uint8_t)(t * 255));
+    if (elapsed >= fadeDuration) {
+        fadingIn = !fadingIn;
+        fadeStartTime = millis();
+        CRGB adjustedColor = applyWhiteAndWarmWhite(currentColor, receivedCommand.white, receivedCommand.warmWhite);
+        fadeStartColor = fadingIn ? CRGB::Black : adjustedColor;
+        fadeTargetColor = fadingIn ? adjustedColor : CRGB::Black;
+        elapsed = 0;
+    }
+    
+    float progress = constrain((float)elapsed / fadeDuration, 0.0, 1.0);
+    // Use sine wave for smoother easing
+    progress = (sin(progress * PI - PI/2) + 1.0) / 2.0;
+    
+    CRGB interpolatedColor = blend(fadeStartColor, fadeTargetColor, (uint8_t)(progress * 255));
     fill_solid(leds, NUM_LEDS, interpolatedColor);
 }
 
-/**
- * @brief Implements a strobe light effect with `currentColor`.
- * The `currentSpeed` controls the flash rate.
- */
 void effectStrobe() {
-    unsigned long strobeDelay = map(currentSpeed, 1, 100, 1000, 50);
+    unsigned long strobeDelay = map(currentSpeed, 1, 100, 800, 30);
     if (millis() - lastEffectRunTime >= strobeDelay) {
         lastEffectRunTime = millis();
         strobeState = !strobeState;
-        fill_solid(leds, NUM_LEDS, strobeState ? currentColor : CRGB::Black);
+    }
+    
+    CRGB strobeColor = strobeState ? 
+                      applyWhiteAndWarmWhite(currentColor, receivedCommand.white, receivedCommand.warmWhite) : 
+                      CRGB::Black;
+    fill_solid(leds, NUM_LEDS, strobeColor);
+}
+
+void effectPulse() {
+    unsigned long pulsePeriod = map(currentSpeed, 1, 100, 4000, 400);
+    pulsePhase = (float)(millis() % pulsePeriod) / pulsePeriod * TWO_PI;
+    float brightnessFactor = (sin(pulsePhase) + 1.0) / 2.0;
+    
+    // Apply smooth cubic easing
+    brightnessFactor = brightnessFactor * brightnessFactor * (3.0 - 2.0 * brightnessFactor);
+    
+    CRGB baseColor = applyWhiteAndWarmWhite(currentColor, receivedCommand.white, receivedCommand.warmWhite);
+    CRGB pulsedColor = baseColor;
+    pulsedColor.nscale8_video(brightnessFactor * 255);
+    fill_solid(leds, NUM_LEDS, pulsedColor);
+}
+
+void effectSparkle() {
+    // Fade existing sparkles
+    for (int i = 0; i < NUM_LEDS; i++) {
+        leds[i].nscale8(240); // Fade by ~6%
+    }
+    
+    // Add new sparkles based on speed
+    int sparkleCount = map(currentSpeed, 1, 100, 1, 8);
+    CRGB sparkleColor = applyWhiteAndWarmWhite(currentColor, receivedCommand.white, receivedCommand.warmWhite);
+    
+    for (int i = 0; i < sparkleCount; i++) {
+        if (random(100) < 30) { // 30% chance per sparkle
+            int pos = random(NUM_LEDS);
+            leds[pos] = sparkleColor;
+        }
     }
 }
 
-
-/**
- * @brief Smoothly pulses the brightness of the `currentColor`.
- * The `currentSpeed` controls the period of the pulse.
- */
-void effectPulse() {
-    unsigned long pulsePeriod = map(currentSpeed, 1, 100, 10000, 1000);
-    float phase = (float)(millis() % pulsePeriod) / pulsePeriod;
-    float brightnessFactor = (sin(phase * TWO_PI) + 1.0) / 2.0;
+void effectWave() {
+    unsigned long waveSpeed = map(currentSpeed, 1, 100, 100, 10);
+    float timeOffset = (float)millis() / waveSpeed;
     
-    // Correct CRGB brightness scaling
-    CRGB pulsedColor = currentColor;
-    pulsedColor.nscale8_video(brightnessFactor * 255);
-    fill_solid(leds, NUM_LEDS, pulsedColor);
+    CRGB waveColor = applyWhiteAndWarmWhite(currentColor, receivedCommand.white, receivedCommand.warmWhite);
+    
+    for (int x = 0; x < LED_WIDTH; x++) {
+        for (int y = 0; y < LED_HEIGHT; y++) {
+            float wave1 = sin((x * 0.3) + timeOffset);
+            float wave2 = sin((y * 0.5) + timeOffset * 1.2);
+            float brightness = (wave1 + wave2 + 2.0) / 4.0; // Normalize to 0-1
+            
+            CRGB pixelColor = waveColor;
+            pixelColor.nscale8_video(brightness * 255);
+            
+            int index = getMatrixIndex(x, y);
+            if (index >= 0 && index < NUM_LEDS) {
+                leds[index] = pixelColor;
+            }
+        }
+    }
+}
+
+// =============================================================================
+// UTILITY FUNCTIONS
+// =============================================================================
+CRGB applyWhiteAndWarmWhite(CRGB color, uint8_t white, uint8_t warmWhite) {
+    CHSV hsv = rgb2hsv_approximate(color);
+    hsv.s = map(white, 0, 255, 255, 0); // Higher white = less saturation
+    
+    CRGB saturatedColor;
+    hsv2rgb_spectrum(hsv, saturatedColor);
+    
+    if (warmWhite > 0) {
+        CRGB warmColor = CRGB(255, map(warmWhite, 0, 255, 120, 255), 20);
+        saturatedColor = blend(saturatedColor, warmColor, warmWhite >> 2); // Subtle warm blend
+    }
+    
+    return saturatedColor;
+}
+
+int16_t getMatrixIndex(int16_t x, int16_t y) {
+    if (x < 0 || x >= LED_WIDTH || y < 0 || y >= LED_HEIGHT) return -1;
+    
+    // Serpentine layout: even rows left-to-right, odd rows right-to-left
+    if (y % 2 == 0) {
+        return y * LED_WIDTH + x;
+    } else {
+        return y * LED_WIDTH + (LED_WIDTH - 1 - x);
+    }
+}
+
+void sendColorRequest() {
+    if (expectingResponse) {
+        Serial.println("⏳ Already waiting for response...");
+        return;
+    }
+    
+    color_request_t request = {1, 1}; // requestType=1, fromReceiver=1
+    
+    Serial.println("📤 Sending color request...");
+    esp_err_t result = esp_now_send(controllerAddress, (uint8_t*)&request, sizeof(request));
+    
+    if (result == ESP_OK) {
+        requestsSent++;
+        Serial.println("✅ Request queued successfully");
+    } else {
+        Serial.printf("❌ Request failed: 0x%X\n", result);
+    }
+}
+
+// =============================================================================
+// DISPLAY & DIAGNOSTIC FUNCTIONS
+// =============================================================================
+void bootSequence() {
+    Serial.println("🌈 Running boot sequence...");
+    
+    const CRGB colors[] = {CRGB::Red, CRGB::Green, CRGB::Blue, CRGB::Yellow, CRGB::Cyan, CRGB::Magenta};
+    const int numColors = sizeof(colors) / sizeof(colors[0]);
+    
+    FastLED.setBrightness(100);
+    
+    // Color sweep
+    for (int c = 0; c < numColors; c++) {
+        fill_solid(leds, NUM_LEDS, colors[c]);
+        FastLED.show();
+        delay(300);
+    }
+    
+    // Wave effect
+    for (int wave = 0; wave < 20; wave++) {
+        for (int i = 0; i < NUM_LEDS; i++) {
+            float brightness = (sin(i * 0.3 + wave * 0.5) + 1.0) / 2.0;
+            leds[i] = CRGB(brightness * 255, brightness * 100, brightness * 255);
+        }
+        FastLED.show();
+        delay(50);
+    }
+    
+    // Fade to black
+    for (int brightness = 255; brightness >= 0; brightness -= 5) {
+        FastLED.setBrightness(brightness);
+        FastLED.show();
+        delay(20);
+    }
+    
+    FastLED.clear();
+    FastLED.setBrightness(map(currentBrightness, 1, 100, 0, 255));
+    FastLED.show();
+    
+    Serial.println("✨ Boot sequence complete!");
+}
+
+void printStatus() {
+    Serial.println("\n" + repeat("━", 50));
+    Serial.println("📊 RECEIVER STATUS");
+    Serial.println(repeat("━", 50));
+    Serial.printf("🔗 Connection: %s\n", isConnected ? "✅ Connected" : "❌ Disconnected");
+    Serial.printf("📨 Commands received: %lu\n", commandsReceived);
+    Serial.printf("📤 Requests sent: %lu\n", requestsSent);
+    Serial.printf("⏳ Expecting response: %s\n", expectingResponse ? "Yes" : "No");
+    Serial.printf("💾 Free heap: %d bytes\n", ESP.getFreeHeap());
+    Serial.println(repeat("━", 50));
+    Serial.printf("🎨 Current color: RGB(%d, %d, %d)\n", currentColor.r, currentColor.g, currentColor.b);
+    Serial.printf("✨ Effect: %d | Speed: %d | Brightness: %d%%\n", currentEffect, currentSpeed, currentBrightness);
+    Serial.println(repeat("━", 50) + "\n");
+}
+
+void printDiagnostics() {
+    Serial.println("\n" + repeat("🔧", 20) + " DIAGNOSTICS " + repeat("🔧", 20));
+    
+    // WiFi info
+    Serial.printf("📡 WiFi Mode: %d\n", WiFi.getMode());
+    Serial.printf("📍 MAC Address: %s\n", WiFi.macAddress().c_str());
+    Serial.printf("📶 WiFi Status: %d\n", WiFi.status());
+    
+    // ESP-NOW info
+    Serial.println("\n🔄 ESP-NOW Peer Info:");
+    Serial.printf("  Controller MAC: ");
+    for(int i = 0; i < 6; i++) {
+        Serial.printf("%02X", controllerAddress[i]);
+        if(i < 5) Serial.print(":");
+    }
+    Serial.println();
+    
+    // Hardware info
+    Serial.printf("\n💾 Memory Info:\n");
+    Serial.printf("  Free Heap: %d bytes\n", ESP.getFreeHeap());
+    Serial.printf("  Min Free Heap: %d bytes\n", ESP.getMinFreeHeap());
+    Serial.printf("  Max Alloc Heap: %d bytes\n", ESP.getMaxAllocHeap());
+    
+    Serial.printf("\n⚡ System Info:\n");
+    Serial.printf("  CPU Frequency: %d MHz\n", ESP.getCpuFreqMHz());
+    Serial.printf("  Flash Size: %d bytes\n", ESP.getFlashChipSize());
+    Serial.printf("  Uptime: %lu seconds\n", millis() / 1000);
+    
+    Serial.println("\n" + repeat("🔧", 55) + "\n");
+}
+
+void printHelp() {
+    Serial.println("\n" + repeat("📚", 25) + " HELP " + repeat("📚", 25));
+    Serial.println("Available Commands:");
+    Serial.println("  request, r     - Request color data from controller");
+    Serial.println("  status, s      - Show connection and LED status");
+    Serial.println("  diag, d        - Show detailed diagnostics");
+    Serial.println("  test, t        - Run LED test sequence");
+    Serial.println("  clear, c       - Turn off all LEDs");
+    Serial.println("  help, h        - Show this help message");
+    Serial.println("  bright <1-100> - Set brightness (e.g., 'bright 75')");
+    Serial.println("  effect <0-6>   - Set effect (0=Solid, 1=Rainbow, 2=Fade, 3=Strobe, 4=Pulse, 5=Sparkle, 6=Wave)");
+    Serial.println("\nEffects:");
+    Serial.println("  0 - Solid Color    4 - Pulse");
+    Serial.println("  1 - Rainbow        5 - Sparkle");
+    Serial.println("  2 - Fade           6 - Wave");
+    Serial.println("  3 - Strobe");
+    Serial.println("\n" + repeat("📚", 58) + "\n");
+}
+
+void showError(const char* message) {
+    Serial.printf("❌ ERROR: %s\n", message);
+    // Flash red LEDs to indicate error
+    for (int i = 0; i < 3; i++) {
+        fill_solid(leds, NUM_LEDS, CRGB::Red);
+        FastLED.show();
+        delay(200);
+        FastLED.clear();
+        FastLED.show();
+        delay(200);
+    }
+}
+
+void showSuccess(const char* message) {
+    Serial.printf("✅ SUCCESS: %s\n", message);
+    // Brief green flash
+    fill_solid(leds, NUM_LEDS, CRGB::Green);
+    FastLED.show();
+    delay(300);
+    FastLED.clear();
+    FastLED.show();
 }
