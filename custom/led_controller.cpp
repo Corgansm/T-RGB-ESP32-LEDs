@@ -48,6 +48,12 @@ typedef struct {
     uint8_t speed;
 } led_command_t;
 
+typedef struct {
+    uint8_t requestType;  // 2 = serial data
+    char data[50];       // Adjust size as needed
+    uint8_t length;       // Actual length of the data
+} serial_message_t;
+
 // =============================================================================
 // GLOBAL VARIABLES
 // =============================================================================
@@ -101,6 +107,7 @@ void sendCommand();
 void sendHeartbeat();
 void readBatteryLevel();
 void updateBatteryDisplay();
+void sendSerialData(const char* message);
 
 // Event handlers
 void colorPickerEvent(lv_event_t *e);
@@ -614,7 +621,12 @@ void readBatteryLevel() {
     // Update battery display
     updateBatteryDisplay();
     
-    Serial.printf("Battery: %d%% (Raw: %d)\n", batteryPercentage, rawValue);
+    char batteryStatus[32];  // Buffer large enough for the message
+    snprintf(batteryStatus, sizeof(batteryStatus), "Battery: %d%% (Raw: %d)", batteryPercentage, rawValue);
+
+    // Output to Serial
+    Serial.println(batteryStatus);
+    sendSerialData(batteryStatus);
 }
 
 void updateBatteryDisplay() {
@@ -681,4 +693,31 @@ void sendCommand() {
 void sendHeartbeat() {
     // Send current state as heartbeat to maintain connection
     sendCommand();
+}
+
+void sendSerialData(const char* message) {
+    static uint32_t lastSendTime = 0;
+    
+    // Rate limiting (optional)
+    if (millis() - lastSendTime < 20) return;
+    lastSendTime = millis();
+
+    serial_message_t serialMsg;
+    serialMsg.requestType = 2;  // Identify this as serial data
+    
+    // Copy and truncate if necessary to fit in our buffer
+    uint8_t len = strlen(message);
+    if (len > sizeof(serialMsg.data)) {
+        len = sizeof(serialMsg.data);
+    }
+    memcpy(serialMsg.data, message, len);
+    serialMsg.length = len;
+    
+    esp_err_t result = esp_now_send(receiverAddress, (uint8_t *)&serialMsg, sizeof(serialMsg));
+    
+    if (result == ESP_OK) {
+        Serial.println("Battery percentage sent to LEDs");
+    } else {
+        Serial.printf("Serial data send failed: 0x%X\n", result);
+    }
 }
