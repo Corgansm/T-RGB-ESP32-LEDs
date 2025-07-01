@@ -161,8 +161,6 @@ void OnDataRecv(const esp_now_recv_info *recv_info, const uint8_t *incomingData,
         Serial.printf("📨 Command received: R:%d G:%d B:%d Effect:%d\n", 
                      receivedCommand.red, receivedCommand.green, 
                      receivedCommand.blue, receivedCommand.effect);
-    } else {
-        Serial.printf("⚠️  Invalid data length: %d (expected %d)\n", len, sizeof(led_command_t));
     }
 
     if (len >= sizeof(serial_message_t)) {
@@ -170,7 +168,6 @@ void OnDataRecv(const esp_now_recv_info *recv_info, const uint8_t *incomingData,
         memcpy(&serialMsg, incomingData, sizeof(serialMsg));
         
         if (serialMsg.requestType == 2) {  // It's serial data
-            Serial.printf("Received serial data (%.*s)\n", serialMsg.length, serialMsg.data);
             
             // Process the received serial data here
             // For example, you could echo it to the local serial port:
